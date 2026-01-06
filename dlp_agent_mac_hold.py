@@ -591,31 +591,21 @@ def send_email_alert(content_preview, violated_app="Unknown App"):
         server.quit()
         print(f"📧 [EMAIL] Alert sent")
     except: pass
-    
+
 def trigger_email_async(content, app_name="Unknown"):
     threading.Thread(target=send_email_alert, args=(content, app_name)).start()
 
-def show_native_alert(title, message):
-    """Hiển thị popup ở giữa màn hình với nội dung cố định, đơn giản."""
-    try:
-        safe_title = title.replace('"', '\\"')
-        safe_msg = message.replace('"', '\\"')
-        # Dùng display alert để hiện hộp thoại giữa màn hình với icon cảnh báo mặc định
-        cmd = f'''display alert "{safe_title}" message "{safe_msg}" as critical buttons {{"OK"}} default button "OK"'''
-        subprocess.run(["osascript", "-e", cmd], check=False)
-    except Exception:
-        pass
-
-def trigger_popup_async(title, message):
-    threading.Thread(target=show_native_alert, args=(title, message), daemon=True).start()
-    
-def show_custom_alert(header, body):
-    """Hiển thị alert đơn giản, dùng thread để không chặn luồng chính."""
-    trigger_popup_async(header, body)
-    
 def show_alert(app_name, source_app="Unknown"):
-    """Alert DLP cố định, không hiển thị From/To."""
-    show_custom_alert("Policy Violation", "Copying Source Code to external apps is restricted.")
+    """Hiện warning alert - chỉ một loại alert duy nhất - không có cooldown để hiện nhanh nhất"""
+    try:
+        # Bỏ cooldown để alert xuất hiện nhanh nhất có thể
+        # Logic tránh spam được xử lý ở delayed_warning qua hash check
+        
+        # Chỉ dùng một loại alert: Warning
+        safe_msg = f"Warning: Code detected from {source_app} to {app_name}. Activity logged."
+        cmd = f'''display alert "DLP Warning" message "{safe_msg}" buttons {{"OK"}} default button "OK" giving up after 5'''
+        subprocess.Popen(["osascript", "-e", cmd])
+    except: pass
 
 # ==============================
 #   AI ENGINE
@@ -638,8 +628,7 @@ def call_azure_llm(content):
         result = "CODE" if "CODE" in res_text.upper() else "TEXT"
         llm_cache[content_hash] = result
         return result
-    except:
-        return "CODE"
+    except: return "CODE"
 
 # ==============================
 #   LOGIC PHÂN TÍCH
@@ -707,7 +696,7 @@ def delayed_warning(app_name, source_app, data_hash):
         
         # Remove khỏi warning_threads để có thể warn lại sau này
         STATE["warning_threads"].discard(data_hash)
-
+        
         # Double check: chỉ hiện warning nếu vẫn là CODE và chưa warn hash này
         if STATE["content_type"] == "CODE" and data_hash not in STATE["warned_hashes"]:
             # Đánh dấu đã warn để không warn lại
@@ -757,7 +746,7 @@ def browser_watchdog_loop(app_name):
                         if STATE["hidden_data"]:
                             STATE["hidden_data"] = None
                         continue
-
+                    
                     # Data mới -> Check
                     STATE["source_app"] = app_name
                     STATE["hidden_data"] = data
@@ -816,12 +805,12 @@ def handle_switch(app_name):
         d_type, data = get_and_clear_clipboard()
         if data:
             if get_content_hash(data) == STATE["safe_hash"]:
-                restore_clipboard(d_type, data)
+                 restore_clipboard(d_type, data)
             else:
-                STATE["hidden_data"] = data
-                STATE["hidden_type"] = d_type
-                STATE["content_type"] = None
-                threading.Thread(target=async_analysis_universal, args=(data, d_type)).start()
+                 STATE["hidden_data"] = data
+                 STATE["hidden_type"] = d_type
+                 STATE["content_type"] = None
+                 threading.Thread(target=async_analysis_universal, args=(data, d_type)).start()
         
         threading.Thread(target=browser_watchdog_loop, args=(app_name,), daemon=True).start()
         return
