@@ -12,6 +12,8 @@ import fcntl
 import smtplib
 import uuid
 import atexit
+import stat
+import signal
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -86,6 +88,12 @@ ALLOWED_DOMAINS = [
     "copilot.microsoft.com", "bing.com",
     "claude.ai", "poe.com", "chatpro.ai", "github.com", "stackoverflow.com"
 ]
+
+# Git Firewall Configuration
+WHITELIST_REPO = ["gitlab.siguna.co", "mycompany.internal"]  # Các repo được phép push
+HOME_DIR = os.path.expanduser("~")
+HOOKS_DIR = os.path.join(HOME_DIR, ".dlp_git_hooks")
+HOOK_FILE = os.path.join(HOOKS_DIR, "pre-push")
 
 STATE = {
     "hidden_data": None,
@@ -479,6 +487,92 @@ def start_smart_killer():
             time.sleep(1.0)
     t = threading.Thread(target=loop_kill); t.daemon = True; t.start()
 
+# ==============================
+#   GIT FIREWALL (DLP - Prevent Push to External Repos)
+# ==============================
+def setup_git_firewall():
+    """Cài đặt Git Firewall để ngăn push lên repo ngoài"""
+    try:
+        # 1. Tạo thư mục và file hook
+        if not os.path.exists(HOOKS_DIR):
+            os.makedirs(HOOKS_DIR)
+        
+        # 2. Tạo pre-push script với whitelist
+        # Escape và format whitelist cho bash array
+        whitelist_str = ' '.join([f'"{repo}"' for repo in WHITELIST_REPO])
+        whitelist_display = ', '.join(WHITELIST_REPO)
+        
+        pre_push_script = f"""#!/bin/bash
+# DLP Agent Git Firewall
+remote="$1"
+url="$2"
+if [ -z "$url" ]; then
+    url=$(git config --get remote."$remote".url)
+fi
+
+# Whitelist repos
+ALLOWED_REPOS=({whitelist_str})
+
+for domain in "${{ALLOWED_REPOS[@]}}"; do
+    if [[ "$url" == *"$domain"* ]]; then
+        exit 0 # Allowed
+    fi
+done
+
+echo "🚫 [DLP] BLOCKED: Push to $url is not allowed."
+echo "💡 Allowed repos: {whitelist_display}"
+exit 1
+"""
+        
+        with open(HOOK_FILE, "w", encoding="utf-8", newline="\n") as f:
+            f.write(pre_push_script)
+        
+        # 3. Cấp quyền thực thi
+        st = os.stat(HOOK_FILE)
+        os.chmod(HOOK_FILE, st.st_mode | stat.S_IEXEC)
+        
+        # 4. Cấu hình Git Global
+        subprocess.run(["git", "config", "--global", "core.hooksPath", HOOKS_DIR], 
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        print("✅ Git Firewall is ACTIVE (Blocking external repo pushes)")
+    except Exception as e:
+        print(f"❌ Git Firewall Setup Error: {e}")
+
+def cleanup_git_firewall():
+    """Gỡ bỏ Git Firewall khi chương trình tắt"""
+    try:
+        # Gỡ bỏ cấu hình core.hooksPath
+        subprocess.run(["git", "config", "--global", "--unset", "core.hooksPath"], 
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("🔓 Git Firewall disabled")
+    except Exception as e:
+        pass  # Silent fail on cleanup
+
+def monitor_git_config():
+    """Monitor và đảm bảo Git Firewall không bị tắt khi app đang chạy"""
+    while RUN_FLAG:
+        try:
+            result = subprocess.run(["git", "config", "--global", "core.hooksPath"], 
+                                    capture_output=True, text=True, timeout=1)
+            current_path = result.stdout.strip()
+            
+            if current_path != HOOKS_DIR:
+                # User đã thay đổi config, enforce lại
+                subprocess.run(["git", "config", "--global", "core.hooksPath", HOOKS_DIR],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except: pass
+        time.sleep(5)
+
+def start_git_firewall():
+    """Khởi động Git Firewall và monitor thread"""
+    setup_git_firewall()
+    # Đăng ký cleanup khi exit
+    atexit.register(cleanup_git_firewall)
+    # Chạy monitor thread
+    t = threading.Thread(target=monitor_git_config, daemon=True)
+    t.start()
+
 def send_email_alert(content_preview, violated_app="Unknown App"):
     if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER: return
     try:
@@ -783,6 +877,7 @@ def start_keyboard_listener():
 def main():
     print("🚀 DLP Agent (Sync State Fix) Started...")
     start_smart_killer()
+    start_git_firewall()  # Khởi động Git Firewall
     if keyboard:
         start_keyboard_listener()
     

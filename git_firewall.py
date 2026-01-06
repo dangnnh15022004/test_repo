@@ -8,7 +8,7 @@ import signal
 import sys
 
 # --- Cấu hình ---
-WHITELIST_DOMAINS = ["gitlab.siguna.co", "mycompany.internal"]
+WHITELIST_REPO = ["gitlab.siguna.co", "mycompany.internal"]
 HOME_DIR = os.path.expanduser("~")
 HOOKS_DIR = os.path.join(HOME_DIR, ".dlp_git_hooks")
 HOOK_FILE = os.path.join(HOOKS_DIR, "pre-push")
@@ -22,7 +22,7 @@ if [ -z "$url" ]; then
 fi
 
 # Whitelist (Python inject vào đây)
-ALLOWED_IPS=({' '.join(WHITELIST_DOMAINS)})
+ALLOWED_IPS=({' '.join(WHITELIST_REPO)})
 
 for domain in "${{ALLOWED_IPS[@]}}"; do
     if [[ "$url" == *"$domain"* ]]; then
