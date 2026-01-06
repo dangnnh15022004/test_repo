@@ -1,0 +1,125 @@
+# Lệnh 1: Dọn dẹp các thư mục build cũ
+rm -rf dist build pkg_staging pkg_scripts DlpAgent.app DlpAgent.pkg
+echo "✅ Dọn dẹp xong."
+
+
+# Lệnh 2: PyInstaller - TẠO BINARY VÀ NHÚNG .ENV 
+pyinstaller --noconfirm --clean --onefile \
+--name "DlpAgent" \
+--icon "logo.icns" \
+--add-data ".env:." \
+dlp_agent_mac.py
+
+
+
+# Lệnh 3: Tạo cấu trúc thư mục App Bundle
+mkdir -p DlpAgent.app/Contents/MacOS
+mkdir -p DlpAgent.app/Contents/Resources
+
+
+
+# Lệnh 4: Copy Binary và Icon
+cp dist/DlpAgent DlpAgent.app/Contents/MacOS/DlpAgent
+cp logo.icns DlpAgent.app/Contents/Resources/
+
+
+# Lệnh 4.1: Cấp quyền thực thi cho binary
+chmod +x DlpAgent.app/Contents/MacOS/DlpAgent
+echo "✅ Cấp quyền thực thi cho binary xong."
+
+
+
+
+# Lệnh 5: Ghi file Info.plist (Thêm LSUIElement: Ẩn App khỏi Dock/Menu Bar)
+cat > DlpAgent.app/Contents/Info.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>DlpAgent</string>
+    <key>CFBundleDisplayName</key>
+    <string>DlpAgent</string>
+    <key>CFBundleExecutable</key>
+    <string>DlpAgent</string>
+    <key>CFBundleIconFile</key>
+    <string>logo.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yourcompany.DlpAgent</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.3</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
+EOF
+echo "✅ App Bundle chuẩn đã tạo."
+
+
+
+# Lệnh 6: Ký Ứng dụng (Code Signing)
+codesign --force --deep --sign - "DlpAgent.app"
+echo "✅ App đã được tự ký."
+
+
+
+
+# Lệnh 7: Staging App Bundle và tạo thư mục scripts
+mkdir -p pkg_staging/Applications
+cp -R DlpAgent.app pkg_staging/Applications/
+mkdir -p pkg_scripts
+echo "✅ App Bundle đã được staging."
+
+
+
+# Lệnh 8: Ghi Postinstall script (CHỈ TẠO PLIST VÀ KHÔNG LOAD NGAY)
+cat > pkg_scripts/postinstall <<EOF
+#!/bin/bash
+APP_PATH="/Applications/DlpAgent.app"
+PLIST_LABEL="com.dlpagent.agent" 
+EXE_PATH="\$APP_PATH/Contents/MacOS/DlpAgent"
+
+LOGGED_IN_USER=\$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print \$3 }')
+
+if [ -n "\$LOGGED_IN_USER" ]; then
+    # 1. Gọi binary với --install để tạo file LaunchAgent (.plist)
+    # Binary sẽ thoát ngay sau khi tạo file
+    sudo -u "\$LOGGED_IN_USER" "\$EXE_PATH" --install
+    
+    # 2. BẮT BUỘC: TẢI DỊCH VỤ NGAY LẬP TỨC để khắc phục lỗi Intune
+    PLIST_PATH="/Users/\$LOGGED_IN_USER/Library/LaunchAgents/\$PLIST_LABEL.plist"
+    
+    if [ -f "\$PLIST_PATH" ]; then
+        # Lệnh load kích hoạt RunAtLoad:true
+        sudo -u "\$LOGGED_IN_USER" launchctl load -w "\$PLIST_PATH" 2>/dev/null
+        echo "✅ Service loaded successfully. Agent should start immediately."
+    fi
+fi
+exit 0
+EOF
+
+
+chmod +x pkg_scripts/postinstall
+echo "✅ Postinstall script đã tạo."
+
+
+
+
+
+# Lệnh 9: Chạy pkgbuild để tạo gói .pkg
+pkgbuild \
+    --root pkg_staging \
+    --identifier com.yourcompany.DlpAgent \
+    --version 1.0.3 \
+    --install-location / \
+    --scripts pkg_scripts \
+    DlpAgent.pkg
+
+
+
+
+# Lệnh 10: Dọn dẹp
+rm -rf dist build pkg_staging pkg_scripts DlpAgent.app
+echo "✅ Dọn dẹp xong. File cài đặt là DlpAgent.pkg"
