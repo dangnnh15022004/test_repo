@@ -591,21 +591,31 @@ def send_email_alert(content_preview, violated_app="Unknown App"):
         server.quit()
         print(f"📧 [EMAIL] Alert sent")
     except: pass
-
+    
 def trigger_email_async(content, app_name="Unknown"):
     threading.Thread(target=send_email_alert, args=(content, app_name)).start()
 
-def show_alert(app_name, source_app="Unknown"):
-    """Hiện warning alert - chỉ một loại alert duy nhất - không có cooldown để hiện nhanh nhất"""
+def show_native_alert(title, message):
+    """Hiển thị popup ở giữa màn hình với nội dung cố định, đơn giản."""
     try:
-        # Bỏ cooldown để alert xuất hiện nhanh nhất có thể
-        # Logic tránh spam được xử lý ở delayed_warning qua hash check
-        
-        # Chỉ dùng một loại alert: Warning
-        safe_msg = f"Warning: Code detected from {source_app} to {app_name}. Activity logged."
-        cmd = f'''display alert "DLP Warning" message "{safe_msg}" buttons {{"OK"}} default button "OK" giving up after 5'''
-        subprocess.Popen(["osascript", "-e", cmd])
-    except: pass
+        safe_title = title.replace('"', '\\"')
+        safe_msg = message.replace('"', '\\"')
+        # Dùng display alert để hiện hộp thoại giữa màn hình với icon cảnh báo mặc định
+        cmd = f'''display alert "{safe_title}" message "{safe_msg}" as critical buttons {{"OK"}} default button "OK"'''
+        subprocess.run(["osascript", "-e", cmd], check=False)
+    except Exception:
+        pass
+
+def trigger_popup_async(title, message):
+    threading.Thread(target=show_native_alert, args=(title, message), daemon=True).start()
+    
+def show_custom_alert(header, body):
+    """Hiển thị alert đơn giản, dùng thread để không chặn luồng chính."""
+    trigger_popup_async(header, body)
+    
+def show_alert(app_name, source_app="Unknown"):
+    """Alert DLP cố định, không hiển thị From/To."""
+    show_custom_alert("Policy Violation", "Copying Source Code to external apps is restricted.")
 
 # ==============================
 #   AI ENGINE
@@ -628,7 +638,8 @@ def call_azure_llm(content):
         result = "CODE" if "CODE" in res_text.upper() else "TEXT"
         llm_cache[content_hash] = result
         return result
-    except: return "CODE"
+    except:
+        return "CODE"
 
 # ==============================
 #   LOGIC PHÂN TÍCH
@@ -690,22 +701,24 @@ def async_analysis_universal(data, d_type):
         STATE["llm_checking"] = False
 
 def delayed_warning(app_name, source_app, data_hash):
-    """Hiện warning ngay lập tức (chạy ngầm) - chỉ một lần cho mỗi hash"""
+    """Hiện cảnh báo sau khi AI xác định là CODE (không phụ thuộc Cmd+V).
+    Áp dụng cho cả browser (chatbot domain) và app ngoài whitelist."""
     try:
         time.sleep(0.1)  # Delay ngắn 0.3 giây để đảm bảo AI check hoàn tất
         
         # Remove khỏi warning_threads để có thể warn lại sau này
         STATE["warning_threads"].discard(data_hash)
-        
+
         # Double check: chỉ hiện warning nếu vẫn là CODE và chưa warn hash này
         if STATE["content_type"] == "CODE" and data_hash not in STATE["warned_hashes"]:
-            # Đánh dấu đã warn để không warn lại
+            # Đánh dấu đã warn để không warn lại trong cùng session
             STATE["warned_hashes"].add(data_hash)
             
-            # Chỉ warn nếu đúng app
+            # Chỉ warn nếu vẫn đang ở đúng app đích
             if STATE["current_app"] == app_name:
                 show_alert(app_name, source_app)
-                # Gửi email (chỉ một lần)
+
+                # Gửi email một lần cho nội dung hiện tại
                 if STATE["hidden_type"] == "file":
                     alert_content = read_file_safe(STATE["hidden_data"]) or "File Content"
                 else:
@@ -746,7 +759,7 @@ def browser_watchdog_loop(app_name):
                         if STATE["hidden_data"]:
                             STATE["hidden_data"] = None
                         continue
-                    
+
                     # Data mới -> Check
                     STATE["source_app"] = app_name
                     STATE["hidden_data"] = data
@@ -805,12 +818,12 @@ def handle_switch(app_name):
         d_type, data = get_and_clear_clipboard()
         if data:
             if get_content_hash(data) == STATE["safe_hash"]:
-                 restore_clipboard(d_type, data)
+                restore_clipboard(d_type, data)
             else:
-                 STATE["hidden_data"] = data
-                 STATE["hidden_type"] = d_type
-                 STATE["content_type"] = None
-                 threading.Thread(target=async_analysis_universal, args=(data, d_type)).start()
+                STATE["hidden_data"] = data
+                STATE["hidden_type"] = d_type
+                STATE["content_type"] = None
+                threading.Thread(target=async_analysis_universal, args=(data, d_type)).start()
         
         threading.Thread(target=browser_watchdog_loop, args=(app_name,), daemon=True).start()
         return
@@ -841,31 +854,11 @@ def handle_switch(app_name):
 #   KEYBOARD LISTENER (FIXED ALERT LOGIC)
 # ==============================
 def on_paste_attempt():
-    """Xử lý Alert khi nhấn Cmd+V (chỉ cho app không được phép, không chặn Gemini)"""
+    """Hiện tại không dùng hotkey Cmd+V để quyết định alert (alert đã chuyển sang delayed_warning)."""
     try:
-        app_name = STATE["current_app"]
-        if app_name in ALLOWED_APPS: return
-        
-        # [FIX] Browser (Gemini, ChatGPT, etc.): Cho phép paste, KHÔNG hiện alert ở đây
-        # Warning sẽ được xử lý bởi delayed_warning thôi
-        if app_name in BROWSER_APPS:
-            # Luôn return cho browser, không hiện alert ở đây
-            return
-
-        # [FIX] Alert warning cho app không được phép (không phải browser)
-        if STATE["content_type"] == "CODE":
-             source_app = STATE.get("source_app", "Unknown")
-             print(f"🚫 [PASTE BLOCK] Triggered in {app_name}")
-             show_alert(app_name, source_app)  # Warning alert (chung một loại)
-             
-             # Gửi email
-             if STATE["hidden_type"] == "file":
-                 alert_content = read_file_safe(STATE["hidden_data"]) or "File Content"
-             else:
-                 alert_content = STATE["hidden_data"]
-             trigger_email_async(alert_content, app_name=app_name)
-
-    except Exception as e: pass
+        return
+    except Exception:
+        pass
 
 def start_keyboard_listener():
     def on_hotkey(): on_paste_attempt()

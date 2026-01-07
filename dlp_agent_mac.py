@@ -13,7 +13,6 @@ import smtplib
 import uuid
 import atexit
 import stat
-import signal
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -26,10 +25,8 @@ try:
     from AppKit import NSWorkspace, NSWorkspaceDidActivateApplicationNotification, NSPasteboard, NSPasteboardTypeString, NSFilenamesPboardType
     from Foundation import NSObject, NSURL
     from PyObjCTools import AppHelper
-    from pynput import keyboard
-    import pyperclip
 except ImportError:
-    print("❌ Thiếu thư viện! Chạy: pip install pyobjc-framework-Cocoa openai python-dotenv pynput pyperclip")
+    print("❌ Thiếu thư viện! Chạy: pip install pyobjc-framework-Cocoa openai python-dotenv pyperclip")
     sys.exit(1)
 
 # ==============================
@@ -90,9 +87,8 @@ ALLOWED_DOMAINS = [
 ]
 
 # Git Firewall Configuration
-WHITELIST_REPO = ["gitlab.siguna.co", "mycompany.internal"]  # Các repo được phép push
-HOME_DIR = os.path.expanduser("~")
-HOOKS_DIR = os.path.join(HOME_DIR, ".dlp_git_hooks")
+WHITELIST_REPO = ["gitlab.siguna.co", "mycompany.internal", "https://github.com/dangnnh15022004/test_repo"]  # Các repo được phép push
+HOOKS_DIR = os.path.join(os.path.expanduser("~"), ".dlp_git_hooks")
 HOOK_FILE = os.path.join(HOOKS_DIR, "pre-push")
 
 STATE = {
@@ -104,12 +100,8 @@ STATE = {
     "safe_hash": None,
     "content_type": None,
     "llm_checking": False,
-    "last_alert_time": 0,
-    "last_alert_app": None,
     "last_clipboard_hash": None,  # Track clipboard hash changes
     "browser_allowed": False,
-    "code_detected_time": 0,
-    "warning_shown": False,
     "warned_hashes": set(),
     "warning_threads": set()
 }
@@ -123,16 +115,52 @@ def get_content_hash(data):
 
 def get_active_browser_url(app_name):
     script = None
+    
+    # Nhóm 1: Chromium based & Safari (Chuẩn AppleScript - Rất ổn định)
     if app_name in ["Google Chrome", "Brave Browser", "Microsoft Edge", "Arc", "Opera", "CocCoc"]:
         script = f'tell application "{app_name}" to get URL of active tab of front window'
     elif app_name == "Safari":
         script = 'tell application "Safari" to get URL of front document'
+        
+    # Nhóm 2: Firefox (Xử lý đặc biệt: UI Scripting + Title Fallback)
+    elif app_name == "Firefox":
+        # Thử lấy URL thật trước
+        script = '''
+        tell application "System Events"
+            tell process "Firefox"
+                try
+                    -- Cách 1: Thử lấy từ thanh địa chỉ (Address Bar)
+                    set theURL to value of UI element 1 of combo box 1 of toolbar "Navigation" of first window
+                    return theURL
+                on error
+                    -- Cách 2: Nếu lỗi, trả về TIÊU ĐỀ CỬA SỔ (Window Title) để Python xử lý fallback
+                    return "TITLE:" & name of first window
+                end try
+            end tell
+        end tell
+        '''
     
     if not script: return ""
+    
     try:
-        # Timeout 0.3s
+        # Timeout ngắn để tránh treo
         result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=0.3)
-        return result.stdout.strip()
+        output = result.stdout.strip()
+
+        # Xử lý Logic Fallback cho Firefox
+        if app_name == "Firefox" and output.startswith("TITLE:"):
+            window_title = output.replace("TITLE:", "").lower()
+            
+            # Map tiêu đề sang domain giả định để whitelist hiểu
+            if "gemini" in window_title: return "https://gemini.google.com"
+            if "chatgpt" in window_title: return "https://chatgpt.com"
+            if "claude" in window_title: return "https://claude.ai"
+            if "github" in window_title: return "https://github.com"
+            if "bing" in window_title or "copilot" in window_title: return "https://copilot.microsoft.com"
+            
+            return "" # Không nhận diện được web nào trong whitelist
+            
+        return output
     except: return ""
 
 def is_domain_allowed(url):
@@ -226,30 +254,6 @@ def restore_clipboard(data_type, data):
         print(f"❌ Restore Error: {e}")
         import traceback
         traceback.print_exc()
-
-def get_pasteboard_change_count():
-    """Track clipboard changes - dùng NSPasteboard changeCount nếu có, không thì dùng hash"""
-    try:
-        # Thử dùng NSPasteboard changeCount trước
-        pb = NSPasteboard.generalPasteboard()
-        return pb.changeCount()
-    except:
-        # Fallback: dùng hash tracking với pyperclip
-        try:
-            content = pyperclip.paste()
-            if content:
-                content_hash = get_content_hash(content)
-                if not hasattr(get_pasteboard_change_count, '_last_hash'):
-                    get_pasteboard_change_count._last_hash = None
-                    get_pasteboard_change_count._counter = 0
-                
-                if content_hash != get_pasteboard_change_count._last_hash:
-                    get_pasteboard_change_count._last_hash = content_hash
-                    get_pasteboard_change_count._counter += 1
-                
-                return get_pasteboard_change_count._counter
-        except: pass
-        return 0
 
 def get_clipboard_hash():
     """Get hash of current clipboard content - ưu tiên NSPasteboard, fallback pyperclip"""
@@ -497,7 +501,22 @@ def setup_git_firewall():
         if not os.path.exists(HOOKS_DIR):
             os.makedirs(HOOKS_DIR)
         
-        # 2. Tạo pre-push script với whitelist
+        # 2. XÁC ĐỊNH CÁCH GỌI LỆNH (Fix lỗi Binary không chạy được với python3)
+        if getattr(sys, 'frozen', False):
+            # Nếu là executable đã đóng gói (.app/binary)
+            agent_script = sys.executable
+            # Gọi trực tiếp binary, KHÔNG dùng python3
+            run_cmd = f'"{agent_script}"'
+        else:
+            # Nếu là script Python thông thường
+            agent_script = os.path.abspath(__file__)
+            # Phải gọi bằng python3
+            run_cmd = f'python3 "{agent_script}"'
+        
+        # Escape đường dẫn cho bash (dùng cho việc kiểm tra file tồn tại)
+        agent_script_escaped = agent_script.replace('"', '\\"')
+        
+        # 3. Tạo pre-push script với whitelist và gửi email khi bị chặn
         # Escape và format whitelist cho bash array
         whitelist_str = ' '.join([f'"{repo}"' for repo in WHITELIST_REPO])
         whitelist_display = ', '.join(WHITELIST_REPO)
@@ -521,17 +540,27 @@ done
 
 echo "🚫 [DLP] BLOCKED: Push to $url is not allowed."
 echo "💡 Allowed repos: {whitelist_display}"
+
+# Gửi email cảnh báo - Logic đã sửa:
+# Kiểm tra file tồn tại, sau đó chạy lệnh run_cmd đã được Python định nghĩa đúng
+if [ -f "{agent_script_escaped}" ]; then
+    # Dùng nohup hoặc & để chạy nền, chuyển hướng output để debug nếu cần
+    {run_cmd} --git-push-alert "$url" > /tmp/dlp_git_email.log 2>&1 &
+else
+    echo "⚠️ [DLP] Agent script not found at: {agent_script_escaped}" >&2
+fi
+
 exit 1
 """
         
         with open(HOOK_FILE, "w", encoding="utf-8", newline="\n") as f:
             f.write(pre_push_script)
         
-        # 3. Cấp quyền thực thi
+        # 4. Cấp quyền thực thi
         st = os.stat(HOOK_FILE)
         os.chmod(HOOK_FILE, st.st_mode | stat.S_IEXEC)
         
-        # 4. Cấu hình Git Global
+        # 5. Cấu hình Git Global
         subprocess.run(["git", "config", "--global", "core.hooksPath", HOOKS_DIR], 
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
@@ -573,27 +602,235 @@ def start_git_firewall():
     t = threading.Thread(target=monitor_git_config, daemon=True)
     t.start()
 
-def send_email_alert(content_preview, violated_app="Unknown App"):
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER: return
+def get_system_detail():
+    """Thu thập thông tin hệ thống để đưa vào email alert."""
     try:
-        # (Giản lược code email để tập trung vào logic chính)
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_SENDER
-        msg['To'] = EMAIL_RECEIVER
-        msg['Subject'] = f"DLP Alert: Code blocked in {violated_app}"
-        body = f"User attempted to paste restricted code into {violated_app}.\n\nContent Preview:\n{str(content_preview)[:500]}..."
-        msg.attach(MIMEText(body, 'plain'))
-        
-        server = smtplib.SMTP('smtp.office365.com', 587)
-        server.ehlo(); server.starttls(); server.ehlo()
+        hostname = socket.gethostname() or platform.node() or "Unknown"
+        # Lấy IP nội bộ
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip_address = s.getsockname()[0]
+            s.close()
+        except:
+            ip_address = "127.0.0.1"
+
+        try:
+            user = os.getenv('SUDO_USER') or os.getenv('USER') or os.getlogin()
+        except Exception:
+            user = "Unknown"
+
+        local_time = time.strftime("%d/%m/%Y %I:%M:%S %p", time.localtime())
+        return {
+            "user": user,
+            "email_mock": f"{user}@{hostname}",
+            "device": hostname,
+            "ip": ip_address,
+            "time_local": local_time
+        }
+    except Exception:
+        return {
+            "user": "Unknown",
+            "email_mock": "Unknown",
+            "device": "Unknown",
+            "ip": "Unknown",
+            "time_local": "Unknown"
+        }
+
+
+def send_email_clipboard_paste(content_preview, violated_app="Unknown App"):
+    """Gửi email cảnh báo DLP cho Clipboard Paste (text)."""
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+        return
+
+    sys_info = get_system_detail()
+
+    if isinstance(content_preview, str):
+        preview = content_preview[:800] + "..." if len(content_preview) > 800 else content_preview
+        preview = preview.replace("<", "&lt;").replace(">", "&gt;")
+    else:
+        preview = "[Non-text Content]"
+
+    alert_id = str(uuid.uuid4())
+    subject = "Medium-severity alert: DLP policy matched for clipboard content in a device"
+
+    html_body = f"""
+    <html><body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f8f9fa; padding: 20px;">
+        <div style="background-color: #fff; padding: 40px; border-radius: 8px; border-top: 6px solid #d83b01; max-width: 750px; margin: auto; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+            <h2 style="color: #212529; margin-top: 0;">A medium-severity alert has been triggered</h2>
+            <p style="font-size: 15px; color: #666;">DLP policy matched for clipboard content on a managed device (macOS).</p>
+            <div style="background-color: #faf9f8; padding: 15px; border-left: 4px solid #a4262c; margin: 20px 0;">
+                <strong style="color: #a4262c;">Severity: Medium</strong>
+            </div>
+            <table style="width: 100%; font-size: 14px; line-height: 1.8; border-collapse: collapse;">
+                <tr><td style="width: 220px; font-weight: bold; color: #444;">Time of occurrence:</td><td>{sys_info['time_local']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Activity:</td><td>DlpRuleMatch (Clipboard Paste)</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">User:</td><td style="color: #0078d4;">{sys_info['email_mock']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Policy:</td><td>DLP_Block_SourceCode</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Alert ID:</td><td style="color: #666; font-family: monospace;">{alert_id}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Application:</td><td style="color: #d83b01; font-weight: bold;">{violated_app}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Device:</td><td>{sys_info['device']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">IP:</td><td>{sys_info['ip']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Status:</td><td style="color: #a4262c; font-weight: bold;">BLOCK</td></tr>
+            </table>
+            <hr style="border: 0; border-top: 1px solid #e1dfdd; margin: 25px 0;">
+            <h3 style="font-size: 16px;">Violating Content Preview:</h3>
+            <div style="background-color: #f3f2f1; padding: 15px; border: 1px solid #e1dfdd; font-family: Consolas, monospace; font-size: 13px; color: #d13438; white-space: pre-wrap;">{preview}</div>
+        </div>
+    </body></html>
+    """
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        server = smtplib.SMTP("smtp.office365.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print(f"📧 [EMAIL] Alert sent")
-    except: pass
+        print("📧 [EMAIL] Clipboard Paste alert sent")
+    except Exception as e:
+        print(f"Email Error: {e}")
+
+def send_email_file_copy(file_path, violated_app="Unknown App"):
+    """Gửi email cảnh báo DLP cho Copy FileCode."""
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+        return
+
+    sys_info = get_system_detail()
+
+    # Đọc preview file nếu có thể
+    file_content_preview = read_file_safe(file_path)
+    if file_content_preview:
+        preview = file_content_preview[:800] + "..." if len(file_content_preview) > 800 else file_content_preview
+        preview = preview.replace("<", "&lt;").replace(">", "&gt;")
+    else:
+        preview = f"[File: {os.path.basename(file_path)}]"
+
+    alert_id = str(uuid.uuid4())
+    subject = "Medium-severity alert: DLP policy matched for file copy in a device"
+
+    html_body = f"""
+    <html><body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f8f9fa; padding: 20px;">
+        <div style="background-color: #fff; padding: 40px; border-radius: 8px; border-top: 6px solid #d83b01; max-width: 750px; margin: auto; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+            <h2 style="color: #212529; margin-top: 0;">A medium-severity alert has been triggered</h2>
+            <p style="font-size: 15px; color: #666;">DLP policy matched for file copy on a managed device (macOS).</p>
+            <div style="background-color: #faf9f8; padding: 15px; border-left: 4px solid #a4262c; margin: 20px 0;">
+                <strong style="color: #a4262c;">Severity: Medium</strong>
+            </div>
+            <table style="width: 100%; font-size: 14px; line-height: 1.8; border-collapse: collapse;">
+                <tr><td style="width: 220px; font-weight: bold; color: #444;">Time of occurrence:</td><td>{sys_info['time_local']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Activity:</td><td>DlpRuleMatch (Copy FileCode)</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">User:</td><td style="color: #0078d4;">{sys_info['email_mock']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Policy:</td><td>DLP_Block_SourceCode</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Alert ID:</td><td style="color: #666; font-family: monospace;">{alert_id}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Application:</td><td style="color: #d83b01; font-weight: bold;">{violated_app}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">File Path:</td><td style="color: #666; font-family: monospace;">{file_path}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Device:</td><td>{sys_info['device']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">IP:</td><td>{sys_info['ip']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Status:</td><td style="color: #a4262c; font-weight: bold;">BLOCK</td></tr>
+            </table>
+            <hr style="border: 0; border-top: 1px solid #e1dfdd; margin: 25px 0;">
+            <h3 style="font-size: 16px;">Violating Content Preview:</h3>
+            <div style="background-color: #f3f2f1; padding: 15px; border: 1px solid #e1dfdd; font-family: Consolas, monospace; font-size: 13px; color: #d13438; white-space: pre-wrap;">{preview}</div>
+        </div>
+    </body></html>
+    """
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        server = smtplib.SMTP("smtp.office365.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("📧 [EMAIL] File Copy alert sent")
+    except Exception as e:
+        print(f"Email Error: {e}")
+
+def send_email_git_push(repo_url, violated_app="Git"):
+    """Gửi email cảnh báo DLP cho Git Push repo ngoài whitelist."""
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+        return
+
+    sys_info = get_system_detail()
+
+    alert_id = str(uuid.uuid4())
+    subject = "Medium-severity alert: DLP policy matched for git push in a device"
+
+    html_body = f"""
+    <html><body style="font-family: 'Segoe UI', sans-serif; color: #333; background-color: #f8f9fa; padding: 20px;">
+        <div style="background-color: #fff; padding: 40px; border-radius: 8px; border-top: 6px solid #d83b01; max-width: 750px; margin: auto; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+            <h2 style="color: #212529; margin-top: 0;">A medium-severity alert has been triggered</h2>
+            <p style="font-size: 15px; color: #666;">DLP policy matched for git push to external repository on a managed device (macOS).</p>
+            <div style="background-color: #faf9f8; padding: 15px; border-left: 4px solid #a4262c; margin: 20px 0;">
+                <strong style="color: #a4262c;">Severity: Medium</strong>
+            </div>
+            <table style="width: 100%; font-size: 14px; line-height: 1.8; border-collapse: collapse;">
+                <tr><td style="width: 220px; font-weight: bold; color: #444;">Time of occurrence:</td><td>{sys_info['time_local']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Activity:</td><td>DlpRuleMatch (Git Push)</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">User:</td><td style="color: #0078d4;">{sys_info['email_mock']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Policy:</td><td>DLP_Block_SourceCode</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Alert ID:</td><td style="color: #666; font-family: monospace;">{alert_id}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Repository URL:</td><td style="color: #d83b01; font-weight: bold; font-family: monospace;">{repo_url}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Device:</td><td>{sys_info['device']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">IP:</td><td>{sys_info['ip']}</td></tr>
+                <tr><td style="font-weight: bold; color: #444;">Status:</td><td style="color: #a4262c; font-weight: bold;">BLOCK</td></tr>
+            </table>
+            <hr style="border: 0; border-top: 1px solid #e1dfdd; margin: 25px 0;">
+            <h3 style="font-size: 16px;">Details:</h3>
+            <div style="background-color: #f3f2f1; padding: 15px; border: 1px solid #e1dfdd; font-family: Consolas, monospace; font-size: 13px; color: #d13438;">
+                Attempted to push code to external repository outside whitelist.
+            </div>
+        </div>
+    </body></html>
+    """
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        server = smtplib.SMTP("smtp.office365.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("📧 [EMAIL] Git Push alert sent")
+    except Exception as e:
+        print(f"Email Error: {e}")
     
-def trigger_email_async(content, app_name="Unknown"):
-    threading.Thread(target=send_email_alert, args=(content, app_name)).start()
+def trigger_email_async(content, app_name="Unknown", email_type="clipboard"):
+    """Trigger email async với loại email khác nhau.
+    
+    Args:
+        content: Nội dung (text hoặc file path)
+        app_name: Tên app vi phạm
+        email_type: "clipboard" (Clipboard Paste), "file" (Copy FileCode), hoặc "git" (Git Push)
+    """
+    if email_type == "file":
+        threading.Thread(target=send_email_file_copy, args=(content, app_name)).start()
+    elif email_type == "git":
+        threading.Thread(target=send_email_git_push, args=(content, app_name)).start()
+    else:  # clipboard (default)
+        threading.Thread(target=send_email_clipboard_paste, args=(content, app_name)).start()
 
 def show_native_alert(title, message):
     """Hiển thị popup ở giữa màn hình với nội dung cố định, đơn giản."""
@@ -674,7 +911,6 @@ def async_analysis_universal(data, d_type):
             # CODE detected
             data_hash = get_content_hash(data)
             print(f"   🤖 AI: CODE -> Detected (Warning will show after delay)")
-            STATE["code_detected_time"] = time.time()
             
             # Chỉ trigger warning nếu:
             # 1. Chưa có thread warning đang chạy cho hash này
@@ -701,7 +937,8 @@ def async_analysis_universal(data, d_type):
         STATE["llm_checking"] = False
 
 def delayed_warning(app_name, source_app, data_hash):
-    """Hiện warning ngay lập tức (chạy ngầm) - chỉ một lần cho mỗi hash"""
+    """Hiện cảnh báo sau khi AI xác định là CODE (không phụ thuộc Cmd+V).
+    Áp dụng cho cả browser (chatbot domain) và app ngoài whitelist."""
     try:
         time.sleep(0.1)  # Delay ngắn 0.3 giây để đảm bảo AI check hoàn tất
         
@@ -710,18 +947,34 @@ def delayed_warning(app_name, source_app, data_hash):
 
         # Double check: chỉ hiện warning nếu vẫn là CODE và chưa warn hash này
         if STATE["content_type"] == "CODE" and data_hash not in STATE["warned_hashes"]:
-            # Đánh dấu đã warn để không warn lại
+            # Đánh dấu đã warn để không warn lại trong cùng session
             STATE["warned_hashes"].add(data_hash)
             
-            # Chỉ warn nếu đúng app
+            # Chỉ warn nếu vẫn đang ở đúng app đích
             if STATE["current_app"] == app_name:
                 show_alert(app_name, source_app)
-                # Gửi email (chỉ một lần)
-                if STATE["hidden_type"] == "file":
-                    alert_content = read_file_safe(STATE["hidden_data"]) or "File Content"
-                else:
-                    alert_content = STATE["hidden_data"]
-                trigger_email_async(alert_content, app_name=app_name)
+
+                # Gửi email CHỈ khi:
+                #  - App không nằm trong ALLOWED_APPS
+                #  - Và (không phải browser) HOẶC là browser nhưng domain KHÔNG thuộc ALLOWED_DOMAINS
+                should_email = False
+                if app_name not in ALLOWED_APPS:
+                    if app_name in BROWSER_APPS:
+                        # Browser: chỉ email nếu domain KHÔNG cho phép
+                        if not STATE.get("browser_allowed", False):
+                            should_email = True
+                    else:
+                        # App thường: luôn email nếu không nằm whitelist
+                        should_email = True
+
+                if should_email and STATE.get("hidden_data"):
+                    # Phân biệt file vs text để gửi email đúng loại
+                    if STATE["hidden_type"] == "file":
+                        # Copy FileCode
+                        trigger_email_async(STATE["hidden_data"], app_name=app_name, email_type="file")
+                    else:
+                        # Clipboard Paste (text)
+                        trigger_email_async(STATE["hidden_data"], app_name=app_name, email_type="clipboard")
     except: 
         # Đảm bảo luôn remove khỏi warning_threads dù có lỗi
         STATE["warning_threads"].discard(data_hash)
@@ -849,48 +1102,12 @@ def handle_switch(app_name):
     threading.Thread(target=async_analysis_universal, args=(data, d_type)).start()
 
 # ==============================
-#   KEYBOARD LISTENER (FIXED ALERT LOGIC)
+#   MAIN
 # ==============================
-def on_paste_attempt():
-    """Xử lý Alert khi nhấn Cmd+V (chỉ cho app không được phép, không chặn Gemini)"""
-    try:
-        app_name = STATE["current_app"]
-        if app_name in ALLOWED_APPS: return
-        
-        # [FIX] Browser (Gemini, ChatGPT, etc.): Cho phép paste, KHÔNG hiện alert ở đây
-        # Warning sẽ được xử lý bởi delayed_warning thôi
-        if app_name in BROWSER_APPS:
-            # Luôn return cho browser, không hiện alert ở đây
-            return
-
-        # [FIX] Alert warning cho app không được phép (không phải browser)
-        if STATE["content_type"] == "CODE":
-             source_app = STATE.get("source_app", "Unknown")
-             print(f"🚫 [PASTE BLOCK] Triggered in {app_name}")
-             show_alert(app_name, source_app)  # Warning alert (chung một loại)
-             
-             # Gửi email
-             if STATE["hidden_type"] == "file":
-                 alert_content = read_file_safe(STATE["hidden_data"]) or "File Content"
-             else:
-                 alert_content = STATE["hidden_data"]
-             trigger_email_async(alert_content, app_name=app_name)
-
-    except Exception as e: pass
-
-def start_keyboard_listener():
-    def on_hotkey(): on_paste_attempt()
-    hotkey = keyboard.HotKey(keyboard.HotKey.parse('<cmd>+v'), on_hotkey)
-    listener = keyboard.Listener(on_press=hotkey.press, on_release=hotkey.release)
-    listener.daemon = True
-    listener.start()
-
 def main():
-    print("🚀 DLP Agent (Sync State Fix) Started...")
+    print("🚀 DLP Agent Started...")
     start_smart_killer()
     start_git_firewall()  # Khởi động Git Firewall
-    if keyboard:
-        start_keyboard_listener()
     
     handler = TrapdoorHandler.new()
     ws = NSWorkspace.sharedWorkspace()
@@ -914,7 +1131,21 @@ if __name__ == "__main__":
         except: pass
         sys.exit(0)
 
-    # 3. Chạy chính
+    # 3. Git Push Alert Handler (được gọi từ git hook)
+    if len(sys.argv) > 1 and sys.argv[1] == "--git-push-alert":
+        if len(sys.argv) > 2:
+            repo_url = sys.argv[2]
+            # Gửi email và exit (không cần single instance check)
+            try:
+                send_email_git_push(repo_url)
+            except Exception as e:
+                print(f"Error sending git push alert: {e}", file=sys.stderr)
+            sys.exit(0)
+        else:
+            print("Usage: dlp_agent_mac.py --git-push-alert <repo_url>", file=sys.stderr)
+            sys.exit(1)
+
+    # 4. Chạy chính (DLP Agent)
     ensure_single_instance()
     
     if not AZURE_ENDPOINT or not AZURE_KEY or not AZURE_MODEL:

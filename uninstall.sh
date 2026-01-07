@@ -27,6 +27,24 @@ echo -e "${BLUE}========================================${NC}"
 echo ""
 
 # ----------------------------------------
+# 0. Xóa quyền Accessibility (Gọn & Mạnh)
+# ----------------------------------------
+echo -e "${YELLOW}[1/6] Removing Accessibility Permissions...${NC}"
+
+# Lấy ID từ file App (nếu file còn tồn tại)
+DETECTED_ID=$(mdls -name kMDItemCFBundleIdentifier -r "$APP_PATH" 2>/dev/null)
+
+# Duyệt qua danh sách: [ID tìm thấy, ID mặc định] và xóa tất cả
+for id in "$DETECTED_ID" "com.yourcompany.DlpAgent"; do
+    # Chỉ chạy nếu ID không rỗng và không phải null
+    if [ -n "$id" ] && [ "$id" != "(null)" ]; then
+        tccutil reset Accessibility "$id" 2>/dev/null
+    fi
+done
+
+echo -e "   ✅ Accessibility permissions reset."
+
+# ----------------------------------------
 # 1. Gỡ bỏ Service (Bây giờ đã tìm thấy file)
 # ----------------------------------------
 echo -e "${YELLOW}[1/5] Removing Background Service...${NC}"
@@ -134,7 +152,21 @@ echo -e "   ✅ Dock restarted."
 
 
 # ----------------------------------------
-# 6. Hoàn tất
+# 6. Gỡ bỏ Git Firewall (QUAN TRỌNG)
+# ----------------------------------------
+echo -e "${YELLOW}[6/7] Removing Git Firewall Rules...${NC}"
+
+# Lệnh này gỡ bỏ trỏ hook toàn cục -> Git trở lại bình thường
+git config --global --unset core.hooksPath
+
+# Xóa thư mục chứa script chặn
+rm -rf "$HOME/.dlp_git_hooks"
+
+echo -e "   ✅ Git Global Config reset."
+echo -e "   ✅ Git Hooks folder deleted."
+
+# ----------------------------------------
+# 7. Hoàn tất
 # ----------------------------------------
 echo ""
 echo -e "${GREEN}========================================${NC}"
